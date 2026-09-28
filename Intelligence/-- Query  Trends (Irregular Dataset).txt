@@ -1,0 +1,94 @@
+--/ Query : Trends (Irregular Data set)
+
+---/ Filter Data for last 10 observations
+WITH _filterin AS(
+SELECT history_id, product_id, price, observed_at,
+ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY observed_at ASC) obs_row
+FROM price_history
+),
+---/ Rolling Median
+_median AS(
+SELECT a.product_id,
+a.obs_row window_end,
+PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY b.price) median
+FROM _filterin a
+JOIN _filterin b
+ON b.product_id = a.product_id
+AND b.obs_row BETWEEN (a.obs_row - 9) AND a.obs_row
+GROUP BY a.product_id, window_end
+),
+---/ Aggregates
+_aggre AS(
+SELECT *,
+COUNT(*) OVER(PARTITION BY product_id ORDER BY obs_row ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) observes,
+SUM(obs_row) OVER(PARTITION BY product_id ORDER BY obs_row ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) sum_x,
+SUM(obs_row * obs_row) OVER(PARTITION BY product_id ORDER BY obs_row ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) sum_x2,
+SUM(price) OVER(PARTITION BY product_id ORDER BY obs_row ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) sum_y,
+SUM(obs_row * price) OVER(PARTITION BY product_id ORDER BY obs_row ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) sum_xy
+FROM _filterin
+),
+---/ Apply Median to aggregations
+_filtered_data AS(
+SELECT a.*, median
+FROM _aggre a
+JOIN _median m
+ON m.product_id = a.product_id
+AND m.window_end = a.obs_row
+),
+---/ Regression
+_regression AS(
+SELECT *,
+CASE
+	WHEN observes < 5 THEN NULL
+	ELSE 
+		((observes * sum_xy) - (sum_x * sum_y)) / NULLIF(((observes * sum_x2) - (sum_x * sum_x)), 0)
+END slope,
+CASE
+	WHEN observes < 5 THEN NULL
+	ELSE
+		(sum_y - (((observes * sum_xy) - (sum_x * sum_y)) /
+		NULLIF(((observes * sum_x2) - (sum_x * sum_x)), 0) * sum_x))
+		/ observes 
+END intercept
+FROM _filtered_data
+), 
+---/ Normalized Slope
+_norm_slope AS(
+SELECT *,
+COALESCE (slope, 0) / NULLIF(median, 0) normal_slope
+FROM _regression
+),
+---/ Define Boundries
+_bound AS(
+SELECT product_id,
+PERCENTILE_CONT(0.1) WITHIN GROUP(ORDER BY normal_slope) thre_10th,
+PERCENTILE_CONT(0.3) WITHIN GROUP(ORDER BY normal_slope) thre_30th,
+PERCENTILE_CONT(0.7) WITHIN GROUP(ORDER BY normal_slope) thre_70th,
+PERCENTILE_CONT(0.9) WITHIN GROUP(ORDER BY normal_slope) thre_90th
+FROM _norm_slope
+GROUP BY product_id
+),
+---/ Set Slope Boundry
+_last_up AS(
+SELECT n.*, thre_10th, thre_30th, thre_70th, thre_90th,
+ROW_NUMBER() OVER(PARTITION BY n.product_id ORDER BY observed_at DESC) row_num
+FROM _bound b
+JOIN _norm_slope n
+ON n.product_id = b.product_id
+),
+---/ Find Trend
+_trend AS(
+SELECT product_id, normal_slope,
+CASE
+	WHEN normal_slope > thre_90th THEN 'Strongly Upward'
+	WHEN normal_slope > thre_70th THEN 'Upward'
+	WHEN normal_slope < thre_10th THEN 'Strongly Downward'
+	WHEN normal_slope < thre_30th THEN 'Downward'
+	ELSE 'Stable'
+END trend_direction
+FROM _last_up
+WHERE row_num = 1
+)
+SELECT *
+FROM _trend
+WHERE normal_slope <> 0;

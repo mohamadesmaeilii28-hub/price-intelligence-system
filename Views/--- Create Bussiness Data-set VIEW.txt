@@ -1,0 +1,8 @@
+---// Create Bussiness Data-set VIEW
+CREATE VIEW price_intel_rep AS
+SELECT ps.store_id, store_name,pi.* 
+FROM price_intel pi
+JOIN products ps
+ON pi.product_id = ps.product_id
+JOIN stores s
+ON s.store_id = ps.store_id;

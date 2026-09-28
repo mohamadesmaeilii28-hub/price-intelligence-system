@@ -1,0 +1,34 @@
+---// Query Status Intel
+
+---/ Price Status
+WITH _filterin AS(
+SELECT history_id, ph.product_id, product_name,current_price, price, observed_at,
+LAG(price) OVER(PARTITION BY ph.product_id ORDER BY observed_at) previous_price
+FROM price_history ph
+JOIN products ps
+ON ps.product_id = ph.product_id
+),
+---/ Aggregates for each product
+_aggre AS(
+SELECT product_id,
+ROUND((AVG(price)), 2) historical_ave,
+MAX(price) historical_max,
+MIN(price) historical_min
+FROM _filterin
+GROUP BY product_id
+),
+---/ Calculating Change
+_chng AS(
+SELECT *,
+price - previous_price change
+FROM _filterin
+),
+---/ Change Percentage
+_chng_per AS (
+SELECT *,
+ROUND(((change/NULLIF(previous_price, 0)) * 100), 2) change_percent 
+FROM _chng
+)
+SELECT * FROM _chng_per ch
+JOIN _aggre a
+ON ch.product_id = a.product_id;

@@ -1,0 +1,114 @@
+--// Create View anomaly_stat
+CREATE VIEW anomaly_stat AS
+---/ Filteration Stage
+WITH _initiate AS(
+SELECT history_id, product_id, price, observed_at,
+LAG(observed_at) OVER(PARTITION BY product_id ORDER BY observed_at) previous_view
+FROM price_history
+),
+---/ Define (X)
+_def_x AS(
+SELECT *,
+EXTRACT(EPOCH FROM(observed_at - previous_view)) elapse
+FROM _initiate
+WHERE previous_view IS NOT NULL
+),
+---/ Aggregations
+_aggre AS(
+SELECT *,
+COUNT(*) OVER(PARTITION BY product_id) observes,
+SUM(elapse) OVER(PARTITION BY product_id) sum_x,
+SUM(elapse * elapse) OVER(PARTITION BY product_id) sum_x2,
+SUM(elapse * price) OVER(PARTITION BY product_id) sum_xy,
+SUM(price) OVER(PARTITION BY product_id) sum_y
+FROM _def_x
+),
+---/ Best Line Fit
+_rqd_reg AS(
+SELECT *,
+CASE
+	WHEN observes < 5 THEN NULL
+	ELSE
+		((observes * sum_xy) - (sum_x * sum_y)) / 
+		NULLIF(((observes * sum_x2) - (sum_x * sum_x)),0)
+END slope,
+CASE
+	WHEN observes < 5 THEN NULL
+	ELSE
+		(sum_y - ((((observes * sum_xy) - (sum_x * sum_y)) / 
+		NULLIF(((observes * sum_x2) - (sum_x * sum_x)),0)) * sum_x)) / 
+		observes
+END intercept
+FROM _aggre
+),
+---/ Predicted Value
+_regression AS(
+Select *,
+(elapse * slope) + intercept predicted_value
+FROM _rqd_reg
+),
+---/ Residuals
+_residual AS(
+SELECT *,
+price - predicted_value residual
+FROM _regression
+),
+---/ IQR Requirement
+_rqd_iqr AS(
+SELECT product_id, 
+PERCENTILE_CONT(0.25) WITHIN GROUP(ORDER BY residual) q1,
+PERCENTILE_CONT(0.75) WITHIN GROUP(ORDER BY residual) q3
+FROM _residual
+GROUP BY product_id
+),
+---/ Settle Q1 & Q3
+_info_iqr AS(
+SELECT history_id, r.product_id, price, observed_at, elapse, predicted_value, residual, q1,q3
+FROM _residual r
+JOIN _rqd_iqr
+ON _rqd_iqr.product_id = r.product_id
+),
+---/ IQR
+_iqr AS(
+SELECT *,
+(q3 - q1) iqr
+FROM _info_iqr
+),
+---/ IQR Boundries
+_bound_iqr AS(
+SELECT *,
+ q1 - (1.5 * iqr) low_bound,
+ q3 + (1.5 * iqr) high_bound
+FROM _iqr
+),
+---/ Anomaly Detection
+_anomaly AS(
+SELECT *,
+CASE
+	WHEN iqr = 0 THEN 'Undetermined'
+	WHEN residual < low_bound OR residual > high_bound THEN 'Anomalous'
+	ELSE 'Normal'
+END anomaly
+FROM _bound_iqr
+),
+---/ Anomaly Duplication
+_anomaly_dup AS(
+SELECT *,
+LAG(anomaly) OVER(PARTITION BY product_id ORDER BY observed_at) anomaly_dup
+FROM _anomaly
+),
+---/ Final Anomaly Query
+_final_anomaly AS (
+SELECT history_id, product_id, observed_at, anomaly,
+CASE
+	WHEN anomaly = 'Anomalous' AND (anomaly_dup IS NULL OR anomaly_dup <> 'Anomalous')
+	THEN 'New Anomaly'
+	WHEN anomaly = 'Anomalous' AND anomaly_dup = 'Anomalous'
+	THEN 'Duplicate'
+	ELSE 'Normal'
+END dup_check,
+ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY observed_at DESC) rn
+FROM _anomaly_dup
+)
+SELECT * FROM _final_anomaly
+WHERE rn = 1;

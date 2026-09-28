@@ -1,0 +1,9 @@
+---// Create Price Detector
+CREATE VIEW price_intel AS
+SELECT ps.history_id, ps.product_id, current_price, ps.observed_at, change, change_percent,
+historical_ave, historical_max, historical_min ,normal_slope, trend_direction, anomaly, dup_check
+FROM price_stat ps
+LEFT JOIN prod_trend tr
+ON ps.product_id = tr.product_id
+LEFT JOIN anomaly_stat a
+ON ps.product_id = a.product_id;
